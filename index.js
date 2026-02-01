@@ -97,7 +97,7 @@ app.post("/api/auth/register", async (req, res) => {
 
     await conn.beginTransaction();
 
-    // 🧍‍♂️ 1. Insert user
+    // 1. Insert user
     const [userResult] = await conn.query(
       "INSERT INTO users (username, email, phone, password_hash, role, status) VALUES (?, ?, ?, ?, ?, 'ACTIVE')",
       [
@@ -110,7 +110,7 @@ app.post("/api/auth/register", async (req, res) => {
     );
     const userId = userResult.insertId;
 
-    // 🏢 2. Insert center (if CENTER_ADMIN)
+    // 2. Insert center (if CENTER_ADMIN)
     if (role === "CENTER_ADMIN") {
       await conn.query(
         `INSERT INTO gamingcenters 
@@ -222,14 +222,17 @@ app.get("/api/pcs/:centerId", authenticate, async (req, res) => {
     res.status(500).json({ error: "PC жагсаалт татахад алдаа гарлаа." });
   }
 });
+
 // PC update
 app.put("/api/pcs/update/:id", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, seat_number, specs, status, center_id } = req.body;
+    const { name, seat_number, specs, status } = req.body;
 
     const result = await q(
-      `UPDATE pcs SET name = ?, seat_number = ?, specs = ?, status = ?, updated_at = NOW() WHERE id = ?`,
+      `UPDATE pcs 
+       SET name = ?, seat_number = ?, specs = ?, status = ?, updated_at = NOW() 
+       WHERE id = ?`,
       [name, seat_number || null, specs || "", status || "AVAILABLE", id]
     );
 
@@ -237,7 +240,6 @@ app.put("/api/pcs/update/:id", authenticate, async (req, res) => {
       return res.status(404).json({ error: "PC олдсонгүй" });
     }
 
-    // optionally return updated row
     const [updated] = await q("SELECT * FROM pcs WHERE id = ?", [id]);
 
     res.json({ success: true, message: "PC шинэчлэгдлээ", pc: updated });
@@ -286,7 +288,6 @@ app.put("/api/center/update", authenticate, async (req, res) => {
   }
 });
 
-
 app.post("/api/pcs/add", authenticate, async (req, res) => {
   try {
     const { center_id, name, seat_number, specs, status } = req.body;
@@ -306,6 +307,142 @@ app.post("/api/pcs/add", authenticate, async (req, res) => {
 });
 
 /* =========================================================
+   📅 RESERVATIONS (BOOKING)  ✅ (ЗАСВАР: давхардлыг арилгасан + wallet deduction)
+   ========================================================= */
+
+// ✅ Захиалга үүсгэх (wallet-оос хасна, сул PC сонгоно)
+// ✅ Захиалга үүсгэх (wallet-оос хасна, сул PC сонгоно, payments-д бичнэ)
+app.post("/api/reservations", authenticate, async (req, res) => {
+  const conn = await db.getConnection();
+  try {
+    const userId = req.user.id;
+    const { centerId, start_time, end_time, total_price } = req.body;
+
+    if (!centerId || !start_time || !end_time || !total_price) {
+      conn.release();
+      return res.status(400).json({ error: "Мэдээлэл дутуу байна." });
+    }
+
+    const start = new Date(start_time);
+    const end = new Date(end_time);
+    const totalPrice = Number(total_price);
+
+    await conn.beginTransaction();
+
+    /* ================= WALLET ================= */
+    const [wrows] = await conn.query(
+      "SELECT * FROM wallets WHERE user_id = ? FOR UPDATE",
+      [userId]
+    );
+
+    if (!wrows.length || Number(wrows[0].balance) < totalPrice) {
+      await conn.rollback();
+      conn.release();
+      return res.status(400).json({ error: "Wallet хүрэлцэхгүй" });
+    }
+
+    const wallet = wrows[0];
+
+    /* ================= PC ================= */
+    const [pcRows] = await conn.query(
+      "SELECT id FROM pcs WHERE center_id = ? AND status = 'AVAILABLE' LIMIT 1",
+      [centerId]
+    );
+
+    if (!pcRows.length) {
+      await conn.rollback();
+      conn.release();
+      return res.status(409).json({ error: "Сул PC алга" });
+    }
+
+    const pcId = pcRows[0].id;
+
+    /* ================= RESERVATION ================= */
+    const [resInsert] = await conn.query(
+      `INSERT INTO reservations
+       (user_id, pc_id, start_time, end_time, total_price, status)
+       VALUES (?, ?, ?, ?, ?, 'PAID')`,
+      [userId, pcId, start, end, totalPrice]
+    );
+
+    const reservationId = resInsert.insertId;
+
+    /* ================= PAYMENTS ================= */
+    await conn.query(
+      `INSERT INTO payments
+       (booking_id, amount, payment_method, status)
+       VALUES (?, ?, 'WALLET', 'SUCCEEDED')`,
+      [reservationId, totalPrice]
+    );
+
+    /* ================= WALLET UPDATE ================= */
+    await conn.query(
+      "UPDATE wallets SET balance = balance - ? WHERE id = ?",
+      [totalPrice, wallet.id]
+    );
+
+    await conn.query(
+      `INSERT INTO wallet_transactions
+       (user_id, type, amount, description)
+       VALUES (?, 'BOOKING', ?, ?)`,
+      [userId, -totalPrice, `Reservation #${reservationId}`]
+    );
+
+    /* ================= PC STATUS ================= */
+    await conn.query(
+      "UPDATE pcs SET status = 'BOOKED' WHERE id = ?",
+      [pcId]
+    );
+
+    await conn.commit();
+    conn.release();
+
+    res.json({
+      success: true,
+      reservationId,
+      status: "PAID",
+      payment: "SUCCEEDED",
+      totalPrice,
+    });
+  } catch (err) {
+    await conn.rollback();
+    conn.release();
+    console.error("❌ RESERVATION ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+
+
+// ✅ Нэвтэрсэн хэрэглэгчийн өөрийн захиалгууд (нэгхэн route үлдээлээ)
+app.get("/api/reservations/my", authenticate, async (req, res) => {
+  try {
+    const rows = await q(
+      `SELECT 
+         r.*,
+         p.name AS pc_name,
+         g.name AS center_name,
+         pay.status AS payment_status,
+         pay.payment_method
+       FROM reservations r
+       LEFT JOIN pcs p ON r.pc_id = p.id
+       LEFT JOIN gamingcenters g ON p.center_id = g.id
+       LEFT JOIN payments pay ON pay.booking_id = r.id
+       WHERE r.user_id = ?
+       ORDER BY r.start_time DESC`,
+      [req.user.id]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error("❌ FETCH MY RESERVATIONS ERROR:", err);
+    res.status(500).json({ error: "Захиалгуудыг татахад алдаа гарлаа." });
+  }
+});
+
+/* =========================================================
    🗺️ GET ALL CENTERS (for map)
    ========================================================= */
 app.get("/api/centers", async (req, res) => {
@@ -317,6 +454,128 @@ app.get("/api/centers", async (req, res) => {
   } catch (err) {
     console.error("❌ FETCH CENTERS ERROR:", err);
     res.status(500).json({ error: "Төвүүдийг татахад алдаа гарлаа." });
+  }
+});
+
+/* =========================================================
+   💰 WALLET API
+   ========================================================= */
+
+// Миний түрийвч (balance + auto create)
+app.get("/api/wallet/me", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // wallet байгаа эсэх шалгах
+    const [rows] = await db.query("SELECT * FROM wallets WHERE user_id = ?", [
+      userId,
+    ]);
+
+    let wallet = rows[0];
+
+    // байхгүй бол 0 баланс бүхий wallet үүсгэнэ
+    if (!wallet) {
+      const [insertRes] = await db.query(
+        "INSERT INTO wallets (user_id, balance) VALUES (?, 0.00)",
+        [userId]
+      );
+      wallet = {
+        id: insertRes.insertId,
+        user_id: userId,
+        balance: 0,
+      };
+    }
+
+    res.json({
+      success: true,
+      wallet,
+    });
+  } catch (err) {
+    console.error("❌ WALLET FETCH ERROR:", err);
+    res.status(500).json({ error: "Түрийвчийн мэдээлэл татахад алдаа гарлаа." });
+  }
+});
+
+// Түрийвч цэнэглэх (topup)
+app.post("/api/wallet/topup", authenticate, async (req, res) => {
+  const conn = await db.getConnection();
+  try {
+    const userId = req.user.id;
+    const { amount, method } = req.body;
+
+    const amt = Number(amount);
+    if (!amt || amt <= 0) {
+      conn.release();
+      return res.status(400).json({ error: "Дүн буруу байна." });
+    }
+
+    await conn.beginTransaction();
+
+    // wallet авах (эсвэл үүсгэх)
+    const [rows] = await conn.query(
+      "SELECT * FROM wallets WHERE user_id = ? FOR UPDATE",
+      [userId]
+    );
+    let wallet = rows[0];
+    if (!wallet) {
+      const [insertRes] = await conn.query(
+        "INSERT INTO wallets (user_id, balance) VALUES (?, 0.00)",
+        [userId]
+      );
+      wallet = { id: insertRes.insertId, user_id: userId, balance: 0 };
+    }
+
+    const newBalance = Number(wallet.balance) + amt;
+
+    // balance шинэчлэх
+    await conn.query("UPDATE wallets SET balance = ? WHERE id = ?", [
+      newBalance,
+      wallet.id,
+    ]);
+
+    // transaction бүртгэх
+    await conn.query(
+      `INSERT INTO wallet_transactions (user_id, type, amount, description)
+       VALUES (?, 'TOPUP', ?, ?)`,
+      [userId, amt, method || "Wallet topup"]
+    );
+
+    await conn.commit();
+    conn.release();
+
+    res.json({
+      success: true,
+      balance: newBalance,
+    });
+  } catch (err) {
+    await conn.rollback();
+    conn.release();
+    console.error("❌ WALLET TOPUP ERROR:", err);
+    res.status(500).json({ error: "Түрийвч цэнэглэх үед алдаа гарлаа." });
+  }
+});
+
+// Түрийвчийн гүйлгээний түүх
+app.get("/api/wallet/transactions", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const tx = await q(
+      `SELECT id, type, amount, description, created_at
+       FROM wallet_transactions
+       WHERE user_id = ?
+       ORDER BY created_at DESC
+       LIMIT 20`,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      transactions: tx,
+    });
+  } catch (err) {
+    console.error("❌ WALLET TX ERROR:", err);
+    res.status(500).json({ error: "Гүйлгээний мэдээлэл татахад алдаа гарлаа." });
   }
 });
 
