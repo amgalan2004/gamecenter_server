@@ -18,15 +18,13 @@ app.use(cors({
   origin: [
     "http://localhost:5173",
     "http://localhost:3000",
+    "http://localhost:4028",
     "https://gamecenter-client.vercel.app"
   ],
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
 }));
 
-// Preflight fix
-app.use(cors());
+
 
 app.use(express.json({ limit: "1mb" }));
 app.use(helmet());
@@ -767,7 +765,7 @@ app.get("/api/stats/platform-stats", async (req, res) => {
   try {
     // Төвийн тоо
     const [centers] = await db.query(
-      "SELECT COUNT(*) AS total FROM gaming_centers"
+      "SELECT COUNT(*) AS total FROM gamingcenters"
     );
 
     // Хэрэглэгчийн тоо
