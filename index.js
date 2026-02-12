@@ -734,6 +734,39 @@ app.get("/api/reports/summary", authenticate, async (req, res) => {
   }
 });
 
+// ================================
+// 📊 PLATFORM STATISTICS API
+// ================================
+app.get("/api/stats/platform-stats", async (req, res) => {
+  try {
+    // Төвийн тоо
+    const [centers] = await db.query(
+      "SELECT COUNT(*) AS total FROM gaming_centers"
+    );
+
+    // Хэрэглэгчийн тоо
+    const [users] = await db.query(
+      "SELECT COUNT(*) AS total FROM users"
+    );
+
+    // Uptime (static for now)
+    const uptime = 99.9;
+
+    res.json({
+      centers: centers[0].total,
+      users: users[0].total,
+      uptime: uptime,
+    });
+  } catch (err) {
+    console.error("Platform stats error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/", (req, res) => {
+  res.send("Gamecenter API is running 🚀");
+});
+
 /* =========================================================
    🚀 SERVER START
    ========================================================= */
