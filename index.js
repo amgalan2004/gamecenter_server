@@ -14,7 +14,20 @@ const app = express();
 /* =========================================================
    🧩 MIDDLEWARES
    ========================================================= */
-app.use(cors({ origin: process.env.CLIENT_URL || "*", credentials: true }));
+app.use(cors({
+  origin: [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://gamecenter-client.vercel.app"
+  ],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
+}));
+
+// Preflight fix
+app.use(cors());
+
 app.use(express.json({ limit: "1mb" }));
 app.use(helmet());
 app.use(morgan("dev"));
@@ -30,15 +43,28 @@ app.use("/api", apiLimiter);
 /* =========================================================
    🗄️ DATABASE CONNECTION
    ========================================================= */
-const db = await mysql.createPool({
-  host: process.env.DB_HOST || "localhost",
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASS || "",
-  database: process.env.DB_NAME || "gamecenter_db",
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-});
+let db;
+
+if (process.env.DATABASE_URL) {
+  // 👉 ONLINE (Render + Railway)
+  db = await mysql.createPool(process.env.DATABASE_URL);
+  console.log("✅ Connected using DATABASE_URL (Production)");
+} else {
+  // 👉 LOCAL (XAMPP)
+  db = await mysql.createPool({
+    host: process.env.DB_HOST || "localhost",
+    user: process.env.DB_USER || "root",
+    password: process.env.DB_PASS || "",
+    database: process.env.DB_NAME || "gamecenter_db",
+    port: process.env.DB_PORT || 3306,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+  });
+
+  console.log("✅ Connected using Local MySQL");
+}
+
 
 const q = async (sql, params = []) => {
   try {
