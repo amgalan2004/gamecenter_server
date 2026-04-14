@@ -1,4 +1,6 @@
 import express from "express";
+import { createServer } from "http";
+import { Server } from "socket.io";
 import mysql from "mysql2/promise";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -7,27 +9,30 @@ import jwt from "jsonwebtoken";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import morgan from "morgan";
+import nodemailer from "nodemailer";
 
 dotenv.config();
+
 const app = express();
+const httpServer = createServer(app);
 
 /* =========================================================
-   🧩 MIDDLEWARES
+    🧩 SOCKET.IO & CORS CONFIG
    ========================================================= */
+const io = new Server(httpServer, {
+  cors: {
+    origin: ["http://localhost:5173", "http://localhost:3000", "http://localhost:4028", "https://gamecenter-client.vercel.app"],
+    credentials: true
+  }
+});
+
 app.use(cors({
-  origin: [
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "http://localhost:4028",
-    "https://gamecenter-client.vercel.app"
-  ],
+  origin: ["http://localhost:5173", "http://localhost:3000", "http://localhost:4028", "https://gamecenter-client.vercel.app"],
   credentials: true
 }));
 
-
-
 app.use(express.json({ limit: "1mb" }));
-app.use(helmet());
+app.use(helmet({ contentSecurityPolicy: false })); 
 app.use(morgan("dev"));
 
 const apiLimiter = rateLimit({
@@ -39,762 +44,479 @@ const apiLimiter = rateLimit({
 app.use("/api", apiLimiter);
 
 /* =========================================================
-   🗄️ DATABASE CONNECTION
+    📧 EMAIL CONFIGURATION & VERIFICATION STORAGE
+   ========================================================= */
+const verificationCodes = new Map();
+
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+/* =========================================================
+    🗄️ DATABASE CONNECTION
    ========================================================= */
 let db;
-
-if (process.env.DATABASE_URL) {
-  // 👉 ONLINE (Render + Railway)
-  db = await mysql.createPool(process.env.DATABASE_URL);
-  console.log("✅ Connected using DATABASE_URL (Production)");
-} else {
-  // 👉 LOCAL (XAMPP)
-  db = await mysql.createPool({
-    host: process.env.DB_HOST || "localhost",
-    user: process.env.DB_USER || "root",
-    password: process.env.DB_PASS || "",
-    database: process.env.DB_NAME || "gamecenter_db",
-    port: Number(process.env.DB_PORT) || 3306,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0,
-  });
-
-  console.log("✅ Connected using Local MySQL");
-}
-
-
-const q = async (sql, params = []) => {
+const initDB = async () => {
   try {
-    const [rows] = await db.query(sql, params);
-    return rows;
-  } catch (err) {
-    console.error("❌ DB QUERY ERROR:", err);
-    throw err;
+    const config = {
+      host: process.env.DB_HOST || "localhost",
+      user: process.env.DB_USER || "root",
+      password: process.env.DB_PASS || "",
+      database: process.env.DB_NAME || "gamecenter_db",
+      port: Number(process.env.DB_PORT) || 3306,
+      waitForConnections: true,
+      connectionLimit: 10,
+      timezone: '+08:00', 
+    };
+    db = await mysql.createPool(config);
+    console.log("✅ Database Connected with UTC+8");
+  } catch (error) {
+    console.error("❌ DB Connection Failed:", error);
+    process.exit(1);
   }
 };
 
+const q = async (sql, params = []) => {
+  const [rows] = await db.query(sql, params);
+  return rows;
+};
+
 /* =========================================================
-   🧠 AUTH
+    🧠 AUTH MIDDLEWARES
    ========================================================= */
 const authenticate = (req, res, next) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader)
-    return res.status(401).json({ error: "Authentication token required" });
-
+  if (!authHeader) return res.status(401).json({ error: "Token required" });
   const token = authHeader.split(" ")[1];
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
     next();
   } catch (err) {
-    return res.status(403).json({ error: "Invalid or expired token" });
+    return res.status(403).json({ error: "Invalid token" });
   }
 };
 
-const requireRoles = (...allowedRoles) => {
-  return (req, res, next) => {
-    const role = req.user?.role;
-    if (!role || !allowedRoles.includes(role)) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
+const isAccountantOrAdmin = (req, res, next) => {
+  if (req.user && (req.user.role === 'ACCOUNTANT' || req.user.role === 'CENTER_ADMIN' || req.user.role === 'OWNER')) {
     next();
-  };
+  } else {
+    res.status(403).json({ error: "Энэ үйлдлийг хийх эрх танд байхгүй" });
+  }
 };
 
 /* =========================================================
-   🧾 REGISTER
+    🧾 AUTHENTICATION & VERIFICATION LOGIC
    ========================================================= */
+
+app.post("/api/auth/send-verification", async (req, res) => {
+  const { centerEmail } = req.body;
+  try {
+    const [admin] = await db.query(
+      "SELECT u.id, g.name FROM users u JOIN gamingcenters g ON u.id = g.user_id WHERE u.email = ?", 
+      [centerEmail]
+    );
+    if (!admin.length) {
+      return res.status(404).json({ error: "Энэ имэйл хаягтай админ эсвэл PC төв олдсонгүй." });
+    }
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    verificationCodes.set(centerEmail, { 
+      code, 
+      expires: Date.now() + 5 * 60 * 1000,
+      centerId: admin[0].id 
+    });
+    await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: centerEmail,
+      subject: "Санхүүч бүртгэлийн баталгаажуулах код",
+      html: `<h2>Санхүүч бүртгэлийн баталгаажуулалт</h2><p>Код: <b>${code}</b></p>`,
+    });
+    res.json({ success: true, message: "Баталгаажуулах код илгээгдлээ." });
+  } catch (error) {
+    res.status(500).json({ error: "Имэйл илгээхэд алдаа гарлаа." });
+  }
+});
+
 app.post("/api/auth/register", async (req, res) => {
   const conn = await db.getConnection();
   try {
-    const {
-      username,
-      email,
-      phone,
-      password,
-      role,
-      location,
-      center_name,
-      latitude,
-      longitude,
+    const { 
+      username, email, phone, password, role, 
+      location, center_name, centerEmail, 
+      verificationCode, latitude, longitude 
     } = req.body;
+    
+    if (!email || !password) return res.status(400).json({ error: "Email and Password required" });
 
-    if (!email || !password)
-      return res.status(400).json({ error: "Имэйл болон нууц үг шаардлагатай." });
+    if (role === "ACCOUNTANT") {
+      const stored = verificationCodes.get(centerEmail);
+      if (!stored || stored.code !== verificationCode || stored.expires < Date.now()) {
+        return res.status(400).json({ error: "Баталгаажуулах код буруу эсвэл хугацаа дууссан байна." });
+      }
+    }
 
-    const exists = await q("SELECT id FROM users WHERE email = ?", [email]);
-    if (exists.length)
-      return res.status(409).json({ error: "Имэйл бүртгэлтэй байна." });
+    const [exists] = await q("SELECT id FROM users WHERE email = ?", [email]);
+    if (exists) return res.status(409).json({ error: "Email already registered" });
 
     const hash = await bcrypt.hash(password, 10);
-
     await conn.beginTransaction();
 
     const normalizedRole = role || "PLAYER";
-
     const [userResult] = await conn.query(
       "INSERT INTO users (username, email, phone, password_hash, role, status) VALUES (?, ?, ?, ?, ?, 'ACTIVE')",
-      [
-        normalizedRole === "CENTER_ADMIN"
-          ? center_name || "Center Owner"
-          : username || "Player",
-        email,
-        phone || null,
-        hash,
-        normalizedRole,
-      ]
+      [normalizedRole === "CENTER_ADMIN" ? center_name : username || "User", email, phone, hash, normalizedRole]
     );
 
     const userId = userResult.insertId;
+    await conn.query("INSERT INTO wallets (user_id, balance) VALUES (?, 0.00)", [userId]);
 
     if (normalizedRole === "CENTER_ADMIN") {
       await conn.query(
-        `INSERT INTO gamingcenters 
-         (user_id, name, location, contact_info, working_hours, tariff, status, latitude, longitude)
-         VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)`,
-        [
-          userId,
-          center_name || "New Game Center",
-          location || "Байршил тодорхойгүй",
-          phone || email,
-          "10:00 - 22:00",
-          10000,
-          latitude ?? 47.918873,
-          longitude ?? 106.917701,
-        ]
+        "INSERT INTO gamingcenters (user_id, name, location, contact_info, status, working_hours, tariff, latitude, longitude) VALUES (?, ?, ?, ?, 'PENDING', '10:00-22:00', 10000, ?, ?)",
+        [userId, center_name, location, email, latitude, longitude]
       );
     }
+    
+    if (role === "ACCOUNTANT") verificationCodes.delete(centerEmail);
 
     await conn.commit();
-    conn.release();
-
-    const token = jwt.sign(
-      { id: userId, role: normalizedRole },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-    );
-
-    res.json({
-      success: true,
-      message: "Бүртгэл амжилттай.",
-      token,
-      user: { id: userId, email, role: normalizedRole },
-    });
+    const token = jwt.sign({ id: userId, role: normalizedRole }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    res.json({ success: true, token, user: { id: userId, email, role: normalizedRole } });
   } catch (err) {
     await conn.rollback();
+    res.status(500).json({ error: "Registration failed" });
+  } finally {
     conn.release();
-    console.error("❌ REGISTER ERROR:", err);
-    res.status(500).json({ error: "Серверийн алдаа гарлаа." });
   }
 });
 
-/* =========================================================
-   🔐 LOGIN
-   ========================================================= */
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-
     const [user] = await q("SELECT * FROM users WHERE email = ?", [email]);
-    if (!user)
-      return res.status(401).json({ error: "Имэйл эсвэл нууц үг буруу байна." });
-
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid)
-      return res.status(401).json({ error: "Имэйл эсвэл нууц үг буруу байна." });
-
-    const token = jwt.sign(
-      { id: user.id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-    );
-
-    res.json({
-      success: true,
-      message: "Нэвтрэлт амжилттай.",
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        username: user.username,
-      },
-    });
-  } catch (err) {
-    console.error("❌ LOGIN ERROR:", err);
-    res.status(500).json({ error: "Серверийн алдаа." });
-  }
-});
-
-/* =========================================================
-   🏢 CENTER_ADMIN — OWN CENTER INFO
-   ========================================================= */
-app.get("/api/center/my-center", authenticate, async (req, res) => {
-  try {
-    const [center] = await q("SELECT * FROM gamingcenters WHERE user_id = ?", [
-      req.user.id,
-    ]);
-    if (!center) return res.status(404).json({ error: "Төв олдсонгүй." });
-    res.json(center);
-  } catch (err) {
-    console.error("❌ CENTER FETCH ERROR:", err);
-    res.status(500).json({ error: "Серверийн алдаа." });
-  }
-});
-
-/* =========================================================
-   ✅ ADMIN STATISTICS (REAL)
-   - totalBookings: тухайн төвийн нийт захиалга
-   - activePlayers: өнөөдөр захиалга хийсэн unique хэрэглэгч
-   - todayRevenue: өнөөдрийн орлого (PAID)
-   - status: төвийн төлөв
-   ========================================================= */
-app.get(
-  "/api/admin/statistics",
-  authenticate,
-  requireRoles("CENTER_ADMIN", "OWNER"),
-  async (req, res) => {
-    try {
-      // admin-ийн center авах
-      const [center] = await q(
-        "SELECT id, status FROM gamingcenters WHERE user_id = ?",
-        [req.user.id]
-      );
-      if (!center) return res.status(404).json({ error: "Төв олдсонгүй." });
-
-      const centerId = center.id;
-
-      // Нийт захиалга
-      const [totalRow] = await q(
-        `SELECT COUNT(*) AS totalBookings
-         FROM reservations r
-         JOIN pcs p ON p.id = r.pc_id
-         WHERE p.center_id = ?`,
-        [centerId]
-      );
-
-      // Өнөөдрийн орлого (PAID)
-      const [revRow] = await q(
-        `SELECT COALESCE(SUM(r.total_price), 0) AS todayRevenue
-         FROM reservations r
-         JOIN pcs p ON p.id = r.pc_id
-         WHERE p.center_id = ?
-           AND DATE(r.created_at) = CURDATE()
-           AND r.status = 'PAID'`,
-        [centerId]
-      );
-
-      // Өнөөдөр идэвхтэй тоглогчид (unique)
-      const [activeRow] = await q(
-        `SELECT COUNT(DISTINCT r.user_id) AS activePlayers
-         FROM reservations r
-         JOIN pcs p ON p.id = r.pc_id
-         WHERE p.center_id = ?
-           AND DATE(r.created_at) = CURDATE()`,
-        [centerId]
-      );
-
-      res.json({
-        success: true,
-        totalBookings: Number(totalRow?.totalBookings || 0),
-        activePlayers: Number(activeRow?.activePlayers || 0),
-        todayRevenue: Number(revRow?.todayRevenue || 0),
-        status: center.status,
-        centerId,
-      });
-    } catch (err) {
-      console.error("❌ ADMIN STATS ERROR:", err);
-      res.status(500).json({ error: "Статистик татахад алдаа гарлаа." });
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+      return res.status(401).json({ error: "Invalid credentials" });
     }
-  }
-);
-
-/* =========================================================
-   💻 PC MANAGEMENT
-   ========================================================= */
-app.get("/api/pcs/:centerId", authenticate, async (req, res) => {
-  try {
-    const { centerId } = req.params;
-    const pcs = await q("SELECT * FROM pcs WHERE center_id = ?", [centerId]);
-    res.json(pcs);
+    const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    res.json({ success: true, token, user: { id: user.id, email: user.email, role: user.role, username: user.username } });
   } catch (err) {
-    console.error("❌ FETCH PCs ERROR:", err);
-    res.status(500).json({ error: "PC жагсаалт татахад алдаа гарлаа." });
+    res.status(500).json({ error: "Login error" });
   }
 });
 
-app.put("/api/pcs/update/:id", authenticate, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, seat_number, specs, status } = req.body;
+/* =========================================================
+    🏢 CENTER & PC MANAGEMENT
+   ========================================================= */
+app.get("/api/centers", async (req, res) => {
+  const centers = await q("SELECT * FROM gamingcenters WHERE status != 'DELETED'");
+  res.json(centers);
+});
 
-    const result = await q(
-      `UPDATE pcs 
-       SET name = ?, seat_number = ?, specs = ?, status = ?, updated_at = NOW() 
-       WHERE id = ?`,
-      [name, seat_number || null, specs || "", status || "AVAILABLE", id]
+app.get("/api/centers/my-center", authenticate, async (req, res) => {
+  try {
+    const [rows] = await db.query("SELECT * FROM gamingcenters WHERE user_id = ?", [req.user.id]);
+    if (rows.length === 0) return res.status(404).json({ error: "Төв олдсонгүй" });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: "Серверийн алдаа" });
+  }
+});
+
+app.put("/api/centers/update/:id", authenticate, isAccountantOrAdmin, async (req, res) => {
+  try {
+    const { name, location, working_hours, tariff } = req.body;
+    const centerId = req.params.id;
+
+    const [result] = await db.query(
+      "UPDATE gamingcenters SET name = ?, location = ?, working_hours = ?, tariff = ? WHERE id = ?",
+      [name, location, working_hours, tariff, centerId]
     );
 
     if (result.affectedRows === 0) {
-      return res.status(404).json({ error: "PC олдсонгүй" });
+        return res.status(404).json({ error: "Төв олдсонгүй эсвэл өөрчлөх эрхгүй байна" });
     }
 
-    const [updated] = await q("SELECT * FROM pcs WHERE id = ?", [id]);
+    res.json({ 
+      success: true, 
+      message: "Төвийн тохиргоо амжилттай шинэчлэгдлээ" 
+    });
 
-    res.json({ success: true, message: "PC шинэчлэгдлээ", pc: updated });
   } catch (err) {
-    console.error("❌ UPDATE PC ERROR:", err);
-    res.status(500).json({ error: "PC шинэчлэх үед алдаа гарлаа." });
+    console.error("Update Error:", err);
+    res.status(500).json({ error: "Серверийн алдаа: Тохиргоо шинэчлэхэд алдаа гарлаа" });
   }
 });
 
-app.delete("/api/pcs/:id", authenticate, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await q("DELETE FROM pcs WHERE id = ?", [id]);
-    if (result.affectedRows === 0)
-      return res.status(404).json({ error: "PC олдсонгүй" });
-    res.json({ success: true, message: "PC устгагдлаа" });
-  } catch (err) {
-    console.error("❌ DELETE PC ERROR:", err);
-    res.status(500).json({ error: "PC устгах үед алдаа гарлаа." });
-  }
-});
-
-app.put("/api/center/update", authenticate, async (req, res) => {
-  try {
-    const { id, name, location, working_hours, tariff } = req.body;
-    if (!id) return res.status(400).json({ error: "ID дутуу байна" });
-
-    const result = await q(
-      `UPDATE gamingcenters 
-       SET name = ?, location = ?, working_hours = ?, tariff = ?, updated_at = NOW() 
-       WHERE id = ? AND user_id = ?`,
-      [name, location, working_hours, tariff, id, req.user.id]
-    );
-
-    if (result.affectedRows === 0)
-      return res.status(404).json({ error: "Төв олдсонгүй эсвэл эрхгүй" });
-
-    const [center] = await q("SELECT * FROM gamingcenters WHERE id = ?", [id]);
-
-    res.json({ success: true, message: "Төвийн мэдээлэл шинэчлэгдлээ", center });
-  } catch (err) {
-    console.error("❌ UPDATE ERROR:", err);
-    res.status(500).json({ error: "Өгөгдөл шинэчлэх үед алдаа гарлаа" });
-  }
+app.get("/api/pcs/:centerId", async (req, res) => {
+  const pcs = await q("SELECT * FROM pcs WHERE center_id = ?", [req.params.centerId]);
+  res.json(pcs);
 });
 
 app.post("/api/pcs/add", authenticate, async (req, res) => {
   try {
-    const { center_id, name, seat_number, specs, status } = req.body;
-    if (!center_id || !name)
-      return res.status(400).json({ error: "center_id эсвэл name дутуу байна." });
+    const { name, seat_number, specs } = req.body;
+    const [centers] = await db.query("SELECT id FROM gamingcenters WHERE user_id = ?", [req.user.id]);
+    if (centers.length === 0) return res.status(404).json({ error: "Төв олдсонгүй." });
 
-    await q(
-      "INSERT INTO pcs (center_id, name, seat_number, specs, status) VALUES (?, ?, ?, ?, ?)",
-      [center_id, name, seat_number || null, specs || "", status || "AVAILABLE"]
+    const center_id = centers[0].id;
+    const [result] = await db.query(
+      "INSERT INTO pcs (center_id, name, seat_number, specs, status) VALUES (?, ?, ?, ?, 'AVAILABLE')",
+      [center_id, name, seat_number, specs]
     );
-
-    res.json({ success: true, message: "Шинэ PC амжилттай нэмэгдлээ." });
+    io.emit("status-changed", { centerId: center_id });
+    res.json({ success: true, id: result.insertId });
   } catch (err) {
-    console.error("❌ ADD PC ERROR:", err);
-    res.status(500).json({ error: "PC нэмэх үед алдаа гарлаа." });
+    res.status(500).json({ error: "PC нэмэхэд алдаа гарлаа" });
   }
 });
 
 /* =========================================================
-   📅 RESERVATIONS
-   - давхцал шалгана
-   - wallet lock
-   - pc lock
+    💰 FINANCE & STATS
    ========================================================= */
-app.post("/api/reservations", authenticate, async (req, res) => {
-  const conn = await db.getConnection();
+
+app.get("/api/finance/today-stats", authenticate, isAccountantOrAdmin, async (req, res) => {
   try {
-    const userId = req.user.id;
-    const { centerId, start_time, end_time, total_price } = req.body;
+    const [center] = await db.query("SELECT id FROM gamingcenters WHERE user_id = ?", [req.user.id]);
+    if (!center.length) return res.status(404).json({ error: "Төв олдсонгүй" });
+    const centerId = center[0].id;
 
-    if (!centerId || !start_time || !end_time || total_price === undefined) {
-      conn.release();
-      return res.status(400).json({ error: "Мэдээлэл дутуу байна." });
-    }
-
-    const start = new Date(start_time);
-    const end = new Date(end_time);
-    const totalPrice = Number(total_price);
-
-    if (Number.isNaN(totalPrice) || totalPrice <= 0) {
-      conn.release();
-      return res.status(400).json({ error: "Үнэ буруу байна." });
-    }
-    if (!(start instanceof Date) || isNaN(start.getTime()) || isNaN(end.getTime()) || start >= end) {
-      conn.release();
-      return res.status(400).json({ error: "Цаг буруу байна." });
-    }
-
-    await conn.beginTransaction();
-
-    // WALLET lock
-    const [wrows] = await conn.query(
-      "SELECT * FROM wallets WHERE user_id = ? FOR UPDATE",
-      [userId]
-    );
-    if (!wrows.length || Number(wrows[0].balance) < totalPrice) {
-      await conn.rollback();
-      conn.release();
-      return res.status(400).json({ error: "Wallet хүрэлцэхгүй" });
-    }
-    const wallet = wrows[0];
-
-    // PC сонгох (AVAILABLE) + lock
-    const [pcRows] = await conn.query(
-      "SELECT id FROM pcs WHERE center_id = ? AND status = 'AVAILABLE' LIMIT 1 FOR UPDATE",
+    const [todayRes] = await db.query(
+      "SELECT COUNT(*) as count FROM reservations r JOIN pcs p ON r.pc_id = p.id WHERE p.center_id = ? AND DATE(r.created_at) = CURDATE()",
       [centerId]
     );
 
-    if (!pcRows.length) {
-      await conn.rollback();
-      conn.release();
-      return res.status(409).json({ error: "Сул PC алга" });
-    }
-
-    const pcId = pcRows[0].id;
-
-    // Давхцал шалгах (энэ pc дээр тухайн хугацаанд захиалга байгаа эсэх)
-    const [conflicts] = await conn.query(
-      `SELECT id FROM reservations
-       WHERE pc_id = ?
-         AND status IN ('PAID','PENDING','CONFIRMED','BOOKED')
-         AND (start_time < ? AND end_time > ?)
-       LIMIT 1`,
-      [pcId, end, start]
+    const [todayIncome] = await db.query(
+      "SELECT SUM(r.total_price) as sum FROM reservations r JOIN pcs p ON r.pc_id = p.id WHERE p.center_id = ? AND (r.status = 'COMPLETED' OR r.status = 'PAID') AND DATE(r.created_at) = CURDATE()",
+      [centerId]
     );
 
-    if (conflicts.length) {
-      await conn.rollback();
-      conn.release();
-      return res.status(409).json({ error: "Энэ хугацаанд PC завгүй байна." });
-    }
-
-    // RESERVATION
-    const [resInsert] = await conn.query(
-      `INSERT INTO reservations
-       (user_id, pc_id, start_time, end_time, total_price, status)
-       VALUES (?, ?, ?, ?, ?, 'PAID')`,
-      [userId, pcId, start, end, totalPrice]
+    const [todayExpense] = await db.query(
+      "SELECT SUM(amount) as sum FROM expenses WHERE center_id = ? AND DATE(created_at) = CURDATE()",
+      [centerId]
     );
-
-    const reservationId = resInsert.insertId;
-
-    // PAYMENTS
-    await conn.query(
-      `INSERT INTO payments
-       (booking_id, amount, payment_method, status)
-       VALUES (?, ?, 'WALLET', 'SUCCEEDED')`,
-      [reservationId, totalPrice]
-    );
-
-    // WALLET UPDATE
-    await conn.query("UPDATE wallets SET balance = balance - ? WHERE id = ?", [
-      totalPrice,
-      wallet.id,
-    ]);
-
-    await conn.query(
-      `INSERT INTO wallet_transactions
-       (user_id, type, amount, description)
-       VALUES (?, 'BOOKING', ?, ?)`,
-      [userId, -totalPrice, `Reservation #${reservationId}`]
-    );
-
-    // PC STATUS
-    await conn.query("UPDATE pcs SET status = 'BOOKED' WHERE id = ?", [pcId]);
-
-    await conn.commit();
-    conn.release();
 
     res.json({
       success: true,
-      reservationId,
-      status: "PAID",
-      payment: "SUCCEEDED",
-      totalPrice,
+      todayReservations: todayRes[0].count || 0,
+      todayIncome: Number(todayIncome[0].sum) || 0,
+      todayExpense: Number(todayExpense[0].sum) || 0
     });
   } catch (err) {
-    await conn.rollback();
-    conn.release();
-    console.error("❌ RESERVATION ERROR:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Өнөөдрийн статистик татахад алдаа гарлаа" });
   }
 });
 
-// My reservations
+app.get("/api/finance/summary", authenticate, isAccountantOrAdmin, async (req, res) => {
+  try {
+    const [incomeResult] = await db.query("SELECT SUM(total_price) as total FROM reservations WHERE status = 'COMPLETED' OR status = 'PAID'");
+    const totalIncome = Number(incomeResult[0].total) || 0;
+
+    const [expenseResult] = await db.query("SELECT SUM(amount) as total FROM expenses");
+    const totalExpense = Number(expenseResult[0].total) || 0;
+
+    const [dailyIncomeStats] = await db.query(`
+      SELECT DATE_FORMAT(created_at, '%m-%d') as date, SUM(total_price) as daily_income
+      FROM reservations WHERE status IN ('COMPLETED', 'PAID')
+      GROUP BY DATE(created_at) ORDER BY created_at ASC
+    `);
+
+    const [recentTransactions] = await db.query(`
+      (SELECT id, 'Захиалга' as description, total_price as amount, 'income' as type, created_at FROM reservations WHERE status IN ('COMPLETED', 'PAID'))
+      UNION ALL
+      (SELECT id, description, amount, 'expense' as type, created_at FROM expenses)
+      ORDER BY created_at DESC
+    `);
+
+    res.json({
+      success: true,
+      totalIncome,
+      totalExpense,
+      netProfit: totalIncome - totalExpense,
+      dailyStats: dailyIncomeStats,
+      recentTransactions
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Санхүүгийн мэдээлэл татахад алдаа гарлаа" });
+  }
+});
+
+app.post("/api/finance/expenses", authenticate, isAccountantOrAdmin, async (req, res) => {
+  try {
+    const { description, amount, category } = req.body;
+    if (!description || !amount || !category) return res.status(400).json({ error: "Мэдээлэл дутуу" });
+
+    const [center] = await db.query("SELECT id FROM gamingcenters WHERE user_id = ?", [req.user.id]);
+    const centerId = center.length > 0 ? center[0].id : null;
+
+    const [result] = await db.query(
+      "INSERT INTO expenses (center_id, description, amount, category, created_at) VALUES (?, ?, ?, ?, NOW())",
+      [centerId, description, amount, category]
+    );
+    io.emit("finance-updated");
+    res.json({ success: true, id: result.insertId });
+  } catch (err) {
+    res.status(500).json({ error: "Зардал бүртгэхэд алдаа гарлаа" });
+  }
+});
+
+app.get("/api/stats/platform-stats", authenticate, isAccountantOrAdmin, async (req, res) => {
+  try {
+    const [resCount] = await db.query("SELECT COUNT(*) as count FROM reservations");
+    const [userCount] = await db.query("SELECT COUNT(*) as count FROM users");
+    const [incomeSum] = await db.query("SELECT SUM(total_price) as sum FROM reservations WHERE status = 'COMPLETED' OR status = 'PAID'");
+    const [centerCount] = await db.query("SELECT COUNT(*) as count FROM gamingcenters WHERE status IN ('ACTIVE', 'APPROVED')");
+
+    res.json({
+      success: true,
+      totalReservations: resCount[0].count || 0,
+      totalUsers: userCount[0].count || 0,
+      totalIncome: Number(incomeSum[0].sum) || 0,
+      totalCenters: centerCount[0].count || 0
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Статистик татахад алдаа гарлаа" });
+  }
+});
+
+/* =========================================================
+    📅 RESERVATIONS (ЗАСВАРЛАГДСАН)
+   ========================================================= */
 app.get("/api/reservations/my", authenticate, async (req, res) => {
   try {
-    const rows = await q(
-      `SELECT 
-         r.*,
-         p.name AS pc_name,
-         g.name AS center_name,
-         pay.status AS payment_status,
-         pay.payment_method
-       FROM reservations r
-       LEFT JOIN pcs p ON r.pc_id = p.id
-       LEFT JOIN gamingcenters g ON p.center_id = g.id
-       LEFT JOIN payments pay ON pay.booking_id = r.id
-       WHERE r.user_id = ?
-       ORDER BY r.start_time DESC`,
-      [req.user.id]
-    );
-
-    res.json(rows);
+    const [bookings] = await db.query(`
+      SELECT r.*, p.name as pc_name, gc.name as center_name 
+      FROM reservations r 
+      JOIN pcs p ON r.pc_id = p.id 
+      JOIN gamingcenters gc ON p.center_id = gc.id 
+      WHERE r.user_id = ? ORDER BY r.created_at DESC
+    `, [req.user.id]);
+    res.json(bookings);
   } catch (err) {
-    console.error("❌ FETCH MY RESERVATIONS ERROR:", err);
-    res.status(500).json({ error: "Захиалгуудыг татахад алдаа гарлаа." });
+    res.status(500).json({ error: "Захиалгын түүх татахад алдаа гарлаа" });
   }
 });
 
-/* =========================================================
-   🗺️ GET ALL CENTERS
-   ========================================================= */
-app.get("/api/centers", async (req, res) => {
-  try {
-    const centers = await q(
-      "SELECT id, name, location, contact_info, working_hours, tariff, latitude, longitude, status FROM gamingcenters WHERE status != 'DELETED'"
-    );
-    res.json(centers);
-  } catch (err) {
-    console.error("❌ FETCH CENTERS ERROR:", err);
-    res.status(500).json({ error: "Төвүүдийг татахад алдаа гарлаа." });
-  }
-});
-
-/* =========================================================
-   💰 WALLET API
-   ========================================================= */
-app.get("/api/wallet/me", authenticate, async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    const [rows] = await db.query("SELECT * FROM wallets WHERE user_id = ?", [
-      userId,
-    ]);
-
-    let wallet = rows[0];
-
-    if (!wallet) {
-      const [insertRes] = await db.query(
-        "INSERT INTO wallets (user_id, balance) VALUES (?, 0.00)",
-        [userId]
-      );
-      wallet = { id: insertRes.insertId, user_id: userId, balance: 0 };
-    }
-
-    res.json({ success: true, wallet });
-  } catch (err) {
-    console.error("❌ WALLET FETCH ERROR:", err);
-    res.status(500).json({ error: "Түрийвчийн мэдээлэл татахад алдаа гарлаа." });
-  }
-});
-
-app.post("/api/wallet/topup", authenticate, async (req, res) => {
+app.post("/api/reservations", authenticate, async (req, res) => {
   const conn = await db.getConnection();
   try {
-    const userId = req.user.id;
-    const { amount, method } = req.body;
-
-    const amt = Number(amount);
-    if (!amt || amt <= 0) {
-      conn.release();
-      return res.status(400).json({ error: "Дүн буруу байна." });
-    }
+    const { centerId, total_price, start_time, end_time } = req.body;
+    let { pcId } = req.body; // Хэрэв client-аас pcId ирвэл ашиглана
 
     await conn.beginTransaction();
 
-    const [rows] = await conn.query(
-      "SELECT * FROM wallets WHERE user_id = ? FOR UPDATE",
-      [userId]
-    );
-
-    let wallet = rows[0];
-    if (!wallet) {
-      const [insertRes] = await conn.query(
-        "INSERT INTO wallets (user_id, balance) VALUES (?, 0.00)",
-        [userId]
-      );
-      wallet = { id: insertRes.insertId, user_id: userId, balance: 0 };
+    // 1. Хэтэвч шалгах
+    const [wallet] = await conn.query("SELECT balance FROM wallets WHERE user_id = ? FOR UPDATE", [req.user.id]);
+    if (!wallet.length || Number(wallet[0].balance) < total_price) {
+        throw new Error("Үлдэгдэл хүрэлцэхгүй байна");
     }
 
-    const newBalance = Number(wallet.balance) + amt;
+    // 2. Хэрэв pcId ирээгүй бол тухайн төвийн боломжтой эхний PC-г олох
+    if (!pcId) {
+        const [availablePcs] = await conn.query(
+            "SELECT id FROM pcs WHERE center_id = ? AND status = 'AVAILABLE' LIMIT 1 FOR UPDATE", 
+            [centerId]
+        );
+        if (!availablePcs.length) throw new Error("Боломжтой PC олдсонгүй");
+        pcId = availablePcs[0].id;
+    } else {
+        // Хэрэв pcId ирсэн бол тэр нь AVAILABLE байгаа эсэхийг шалгах
+        const [checkPc] = await conn.query(
+            "SELECT id FROM pcs WHERE id = ? AND status = 'AVAILABLE' FOR UPDATE", 
+            [pcId]
+        );
+        if (!checkPc.length) throw new Error("Сонгосон PC захиалгатай эсвэл олдсонгүй");
+    }
 
-    await conn.query("UPDATE wallets SET balance = ? WHERE id = ?", [
-      newBalance,
-      wallet.id,
-    ]);
-
-    await conn.query(
-      `INSERT INTO wallet_transactions (user_id, type, amount, description)
-       VALUES (?, 'TOPUP', ?, ?)`,
-      [userId, amt, method || "Wallet topup"]
+    // 3. Захиалга бүртгэх
+    const [resResult] = await conn.query(
+      "INSERT INTO reservations (user_id, pc_id, start_time, end_time, total_price, status, created_at) VALUES (?, ?, ?, ?, ?, 'COMPLETED', NOW())",
+      [req.user.id, pcId, start_time, end_time, total_price]
     );
 
-    await conn.commit();
-    conn.release();
+    const bookingId = resResult.insertId;
 
-    res.json({ success: true, balance: newBalance });
+    // 4. Төлбөр болон гүйлгээний түүх
+    await conn.query("INSERT INTO payments (booking_id, amount, payment_method, status, created_at) VALUES (?, ?, 'WALLET', 'SUCCEEDED', NOW())", [bookingId, total_price]);
+    await conn.query("INSERT INTO wallet_transactions (user_id, type, amount, description, created_at) VALUES (?, 'BOOKING', ?, ?, NOW())", [req.user.id, -total_price, `Захиалга #${bookingId}`]);
+    
+    // 5. Үлдэгдэл болон PC-н төлөв шинэчлэх
+    await conn.query("UPDATE wallets SET balance = balance - ? WHERE user_id = ?", [total_price, req.user.id]);
+    await conn.query("UPDATE pcs SET status = 'BOOKED' WHERE id = ?", [pcId]);
+
+    await conn.commit();
+
+    // Socket мэдэгдэл
+    io.emit("status-changed", { pc_id: pcId, status: "BOOKED", centerId });
+    io.emit("finance-updated"); 
+
+    res.json({ 
+        success: true, 
+        balance: Number(wallet[0].balance) - total_price, 
+        bookingId 
+    });
+
   } catch (err) {
     await conn.rollback();
+    console.error("Booking Error:", err.message);
+    res.status(400).json({ error: err.message });
+  } finally {
     conn.release();
-    console.error("❌ WALLET TOPUP ERROR:", err);
-    res.status(500).json({ error: "Түрийвч цэнэглэх үед алдаа гарлаа." });
+  }
+});
+
+/* =========================================================
+    📊 WALLET & TRANSACTIONS
+   ========================================================= */
+app.get("/api/wallet/me", authenticate, async (req, res) => {
+  try {
+    const [rows] = await db.query("SELECT balance FROM wallets WHERE user_id = ?", [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: "Түрийвч олдсонгүй" });
+    res.json({ success: true, wallet: { balance: Number(rows[0].balance) } });
+  } catch (err) {
+    res.status(500).json({ error: "Түрийвч татахад алдаа гарлаа" });
   }
 });
 
 app.get("/api/wallet/transactions", authenticate, async (req, res) => {
   try {
-    const userId = req.user.id;
-
-    const tx = await q(
-      `SELECT id, type, amount, description, created_at
-       FROM wallet_transactions
-       WHERE user_id = ?
-       ORDER BY created_at DESC
-       LIMIT 50`,
-      [userId]
+    const [rows] = await db.query(
+      "SELECT * FROM wallet_transactions WHERE user_id = ? ORDER BY created_at DESC", 
+      [req.user.id]
     );
-
-    res.json({ success: true, transactions: tx });
+    res.json({ success: true, transactions: rows });
   } catch (err) {
-    console.error("❌ WALLET TX ERROR:", err);
-    res.status(500).json({ error: "Гүйлгээний мэдээлэл татахад алдаа гарлаа." });
+    res.status(500).json({ error: "Гүйлгээний түүх татахад алдаа гарлаа" });
   }
 });
 
-/* =========================================================
-   💥 GLOBAL ERROR HANDLER
-   ========================================================= */
-app.use((err, req, res, next) => {
-  console.error("💥 GLOBAL ERROR:", err);
-  res.status(500).json({ error: "Internal Server Error" });
-});
-
-/* =========================================================
-   📊 ADMIN STATISTICS
-   ========================================================= */
-app.get("/api/admin/statistics", authenticate, async (req, res) => {
+app.post("/api/wallet/topup", authenticate, async (req, res) => {
   try {
-    // Нийт захиалга
-    const [{ totalBookings }] = await q(
-      "SELECT COUNT(*) AS totalBookings FROM reservations"
-    );
-
-    // Өнөөдрийн ашиг
-    const [{ todayRevenue }] = await q(
-      `SELECT IFNULL(SUM(total_price),0) AS todayRevenue
-       FROM reservations
-       WHERE DATE(created_at) = CURDATE()`
-    );
-
-    // Идэвхтэй тоглогчид (өнөөдөр захиалга хийсэн unique user)
-    const [{ activePlayers }] = await q(
-      `SELECT COUNT(DISTINCT user_id) AS activePlayers
-       FROM reservations
-       WHERE DATE(created_at) = CURDATE()`
-    );
-
-    res.json({
-      totalBookings,
-      activePlayers,
-      todayRevenue,
-      status: "APPROVED",
-    });
+    const { amount } = req.body;
+    await db.query("UPDATE wallets SET balance = balance + ? WHERE user_id = ?", [amount, req.user.id]);
+    await db.query("INSERT INTO wallet_transactions (user_id, type, amount, description, created_at) VALUES (?, 'TOPUP', ?, 'Цэнэглэлт', NOW())", [req.user.id, amount]);
+    res.json({ success: true });
   } catch (err) {
-    console.error("❌ ADMIN STAT ERROR:", err);
-    res.status(500).json({ error: "Статистик татахад алдаа гарлаа." });
+    res.status(500).json({ error: "Цэнэглэхэд алдаа гарлаа" });
   }
 });
 
 /* =========================================================
-   📊 REPORTS (CENTER ADMIN)
+    🚀 SERVER START
    ========================================================= */
-app.get("/api/reports/summary", authenticate, async (req, res) => {
-  try {
-    const userId = req.user.id;
+const startServer = async () => {
+  await initDB();
+  
+  io.on("connection", (socket) => {
+    console.log("📡 User Connected:", socket.id);
+  });
 
-    // админы төв
-    const [center] = await q(
-      "SELECT id FROM gamingcenters WHERE user_id = ?",
-      [userId]
-    );
-    if (!center) {
-      return res.status(404).json({ error: "Төв олдсонгүй" });
-    }
+  const PORT = process.env.PORT || 5000;
+  httpServer.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+  });
+};
 
-    const centerId = center.id;
-
-    // өнөөдөр
-    const rows = await q(
-      `
-      SELECT
-        COUNT(r.id)            AS total_bookings,
-        IFNULL(SUM(r.total_price),0) AS total_income,
-        COUNT(DISTINCT r.user_id) AS active_players
-      FROM reservations r
-      JOIN pcs p ON r.pc_id = p.id
-      WHERE p.center_id = ?
-        AND DATE(r.start_time) = CURDATE()
-      `,
-      [centerId]
-    );
-
-    res.json({
-      success: true,
-      report: rows[0],
-    });
-  } catch (err) {
-    console.error("❌ REPORT ERROR:", err);
-    res.status(500).json({ error: "Тайлан татах үед алдаа гарлаа" });
-  }
-});
-
-// ================================
-// 📊 PLATFORM STATISTICS API
-// ================================
-app.get("/api/stats/platform-stats", async (req, res) => {
-  try {
-    // Төвийн тоо
-    const [centers] = await db.query(
-      "SELECT COUNT(*) AS total FROM gamingcenters"
-    );
-
-    // Хэрэглэгчийн тоо
-    const [users] = await db.query(
-      "SELECT COUNT(*) AS total FROM users"
-    );
-
-    // Uptime (static for now)
-    const uptime = 99.9;
-
-    res.json({
-      centers: centers[0].total,
-      users: users[0].total,
-      uptime: uptime,
-    });
-  } catch (err) {
-    console.error("Platform stats error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.get("/", (req, res) => {
-  res.send("Gamecenter API is running 🚀");
-});
-
-/* =========================================================
-   🚀 SERVER START
-   ========================================================= */
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+startServer();
