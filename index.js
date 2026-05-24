@@ -520,6 +520,83 @@ app.get("/api/reservations/my", authenticate, async (req, res) => {
   }
 });
 
+// ✅ Захиалга цуцлах
+app.put("/api/reservations/:id/cancel", authenticate, async (req, res) => {
+  const conn = await db.getConnection();
+  try {
+    const reservationId = req.params.id;
+
+    // Захиалга байгаа эсэх + эзэмшигч мөн эсэхийг шалгана
+    const [rows] = await conn.query(
+      "SELECT r.*, p.center_id FROM reservations r JOIN pcs p ON r.pc_id = p.id WHERE r.id = ? AND r.user_id = ?",
+      [reservationId, req.user.id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Захиалга олдсонгүй" });
+    }
+
+    const reservation = rows[0];
+
+    // Цаг эхлсэн бол цуцлах боломжгүй
+    if (new Date(reservation.start_time) <= new Date()) {
+      return res.status(400).json({ error: "Захиалгын цаг эхэлсэн тул цуцлах боломжгүй" });
+    }
+
+    // CANCELLED биш статустай байх ёстой
+    if (reservation.status === "CANCELLED" || reservation.status === "AUTO_CANCELLED") {
+      return res.status(400).json({ error: "Захиалга аль хэдийн цуцлагдсан байна" });
+    }
+
+    await conn.beginTransaction();
+
+    // Захиалгыг CANCELLED болгоно
+    await conn.query(
+      "UPDATE reservations SET status = 'CANCELLED' WHERE id = ?",
+      [reservationId]
+    );
+
+    // PC-г AVAILABLE болгоно
+    await conn.query(
+      "UPDATE pcs SET status = 'AVAILABLE' WHERE id = ?",
+      [reservation.pc_id]
+    );
+
+    // Төлбөрийг буцаана (wallet-д нэмнэ)
+    await conn.query(
+      "UPDATE wallets SET balance = balance + ? WHERE user_id = ?",
+      [reservation.total_price, req.user.id]
+    );
+
+    // Буцаалтын гүйлгээ бүртгэнэ
+    await conn.query(
+      "INSERT INTO wallet_transactions (user_id, type, amount, description, created_at) VALUES (?, 'REFUND', ?, ?, NOW())",
+      [req.user.id, reservation.total_price, `Захиалга #${reservationId} цуцлалт - буцаалт`]
+    );
+
+    await conn.commit();
+
+    // Real-time мэдэгдэл
+    io.emit("status-changed", {
+      pc_id: reservation.pc_id,
+      status: "AVAILABLE",
+      centerId: reservation.center_id,
+    });
+
+    res.json({
+      success: true,
+      message: `Захиалга цуцлагдлаа. ${Number(reservation.total_price).toLocaleString()}₮ буцааллаа.`,
+      refundAmount: reservation.total_price,
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error("Cancel error:", err);
+    res.status(500).json({ error: "Цуцлахад алдаа гарлаа" });
+  } finally {
+    conn.release();
+  }
+});
+
 app.post("/api/reservations", authenticate, async (req, res) => {
   const conn = await db.getConnection();
   try {
@@ -544,22 +621,23 @@ app.post("/api/reservations", authenticate, async (req, res) => {
     }
 
     const [wallet] = await conn.query("SELECT balance FROM wallets WHERE user_id = ? FOR UPDATE", [req.user.id]);
-    if (!wallet.length || Number(wallet[0].balance) < total_price) {
-      throw new Error("Үлдэгдэл хүрэлцэхгүй байна");
-    }
+if (!wallet.length || Number(wallet[0].balance) < total_price) {
+  throw new Error("Үлдэгдэл хүрэлцэхгүй байна");
+}
 
     await conn.query("UPDATE pcs SET status = 'BOOKED' WHERE id = ?", [pcId]);
 
     const [resResult] = await conn.query(
-      "INSERT INTO reservations (user_id, pc_id, start_time, end_time, total_price, status, created_at) VALUES (?, ?, ?, ?, ?, 'COMPLETED', NOW())",
-      [req.user.id, pcId, start_time, end_time, total_price]
-    );
+  "INSERT INTO reservations (user_id, pc_id, start_time, end_time, total_price, `status`, created_at) VALUES (?, ?, ?, ?, ?, 'PAID', NOW())",
+  [req.user.id, pcId, start_time, end_time, total_price]
+);
 
     await conn.query("UPDATE wallets SET balance = balance - ? WHERE user_id = ?", [total_price, req.user.id]);
-    await conn.query(
-      "INSERT INTO wallet_transactions (user_id, type, amount, description, created_at) VALUES (?, 'BOOKING', ?, ?, NOW())",
-      [req.user.id, total_price, `Reservation #${resResult.insertId}`]
-    );
+// ✅ backtick нэмсэн:
+await conn.query(
+  "INSERT INTO wallet_transactions (user_id, `type`, amount, description, created_at) VALUES (?, 'BOOKING', ?, ?, NOW())",
+  [req.user.id, total_price, `Reservation #${resResult.insertId}`]
+);
 
     await conn.commit();
     io.emit("status-changed", { pc_id: pcId, status: "BOOKED", centerId });
